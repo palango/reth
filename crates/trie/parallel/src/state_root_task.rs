@@ -14,7 +14,7 @@ use reth_trie::{
     updates::TrieUpdates, HashedPostState, HashedStorage, MultiProofTargetsV2, ProofV2Target,
 };
 use revm::state::EvmState;
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 use tracing::trace;
 
 /// Messages used internally by the multi proof task.
@@ -184,6 +184,7 @@ impl StateRootHandle {
             name: "sparse-trie",
             hook: Some(hook),
             cancel_guard: Some(self.cancel_guard),
+            timeout: None,
             state_root_rx: self.state_root_rx.take(),
             hashed_state_rx: self.hashed_state_rx.take(),
         }
@@ -213,6 +214,8 @@ pub struct PayloadStateRootHandle {
     hook: Option<StateRootUpdateHook>,
     /// Cancels the backing task when the handle is dropped without consuming the result.
     cancel_guard: Option<StateRootTaskCancelGuard>,
+    /// Upper bound on the wait in [`PayloadStateRootHandle::state_root`]; `None` waits forever.
+    timeout: Option<Duration>,
     state_root_rx:
         Option<std::sync::mpsc::Receiver<Result<StateRootComputeOutcome, StateRootTaskError>>>,
     hashed_state_rx: Option<std::sync::mpsc::Receiver<Arc<HashedPostState>>>,
@@ -224,6 +227,7 @@ impl fmt::Debug for PayloadStateRootHandle {
             .field("name", &self.name)
             .field("has_hook", &self.hook.is_some())
             .field("has_cancel_guard", &self.cancel_guard.is_some())
+            .field("timeout", &self.timeout)
             .field("has_state_root_rx", &self.state_root_rx.is_some())
             .field("has_hashed_state_rx", &self.hashed_state_rx.is_some())
             .finish()
@@ -243,12 +247,35 @@ impl PayloadStateRootHandle {
         >,
         hashed_state_rx: Option<std::sync::mpsc::Receiver<Arc<HashedPostState>>>,
     ) -> Self {
-        Self { name, hook, cancel_guard: None, state_root_rx: Some(state_root_rx), hashed_state_rx }
+        Self {
+            name,
+            hook,
+            cancel_guard: None,
+            timeout: None,
+            state_root_rx: Some(state_root_rx),
+            hashed_state_rx,
+        }
+    }
+
+    /// Bounds how long [`Self::state_root`] waits for the task's result.
+    ///
+    /// A payload builder cannot race a fallback against the task the way the engine does,
+    /// because finishing the block consumes the block builder: a build that hits this bound pays
+    /// the wait *and* the synchronous walk that replaces it. The bound is a hang breaker, not a
+    /// latency knob, so it belongs well above the expected state-root time.
+    pub const fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Returns the task name used in logs.
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Returns the bound on the wait for the task's result, if any.
+    pub const fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     /// Takes the state hook that streams execution updates and finishes the stream on drop.
@@ -260,17 +287,28 @@ impl PayloadStateRootHandle {
         self.hook.take().expect("payload state root task missing execution hook")
     }
 
-    /// Awaits the state root computation result.
+    /// Awaits the state root computation result, for at most [`Self::timeout`].
+    ///
+    /// A task that is alive but stuck never answers, so an unbounded wait here parks the calling
+    /// build thread for good. Both error cases leave the caller to compute the root another way;
+    /// dropping the handle then cancels the abandoned task.
     ///
     /// # Panics
     ///
     /// If called more than once.
     pub fn state_root(&mut self) -> Result<StateRootComputeOutcome, StateRootTaskError> {
-        self.state_root_rx
-            .take()
-            .expect("state_root already taken")
-            .recv()
-            .map_err(|_| StateRootTaskError::Other("state root task dropped".to_string()))?
+        let state_root_rx = self.state_root_rx.take().expect("state_root already taken");
+        match self.timeout {
+            Some(timeout) => state_root_rx.recv_timeout(timeout).map_err(|err| match err {
+                std::sync::mpsc::RecvTimeoutError::Timeout => StateRootTaskError::Timeout(timeout),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    StateRootTaskError::Other("state root task dropped".to_string())
+                }
+            })?,
+            None => state_root_rx
+                .recv()
+                .map_err(|_| StateRootTaskError::Other("state root task dropped".to_string()))?,
+        }
     }
 
     /// Takes the state root receiver for use with custom waiting logic (e.g., timeouts).
@@ -725,17 +763,74 @@ mod tests {
         assert!(rx.recv().is_ok());
         assert!(handle.try_take_hashed_state_rx().is_none(), "second take returns None");
 
-        state_root_tx
-            .send(Ok(StateRootComputeOutcome {
-                state_root: B256::repeat_byte(0x42),
-                trie_updates: Arc::new(TrieUpdates::default()),
-                hashed_state: Arc::new(HashedPostState::default()),
-                #[cfg(feature = "trie-debug")]
-                debug_recorders: Vec::new(),
-            }))
-            .unwrap();
+        state_root_tx.send(Ok(test_outcome(B256::repeat_byte(0x42)))).unwrap();
         let outcome = handle.state_root().expect("outcome is delivered");
         assert_eq!(outcome.state_root, B256::repeat_byte(0x42));
+    }
+
+    /// A handle without a timeout keeps waiting for a root that arrives late.
+    #[test]
+    fn payload_state_root_without_timeout_awaits_late_root() {
+        let (state_root_tx, state_root_rx) = std::sync::mpsc::channel();
+        let mut handle = PayloadStateRootHandle::new("test", None, state_root_rx, None);
+        assert_eq!(handle.timeout(), None);
+
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            state_root_tx.send(Ok(test_outcome(B256::repeat_byte(0x42)))).unwrap();
+        });
+
+        assert_eq!(
+            handle.state_root().expect("outcome is delivered").state_root,
+            B256::repeat_byte(0x42)
+        );
+        sender.join().unwrap();
+    }
+
+    /// A root that arrives inside the bound is used, timeout or not.
+    #[test]
+    fn payload_state_root_with_timeout_returns_root_sent_in_time() {
+        let (state_root_tx, state_root_rx) = std::sync::mpsc::channel();
+        let mut handle = PayloadStateRootHandle::new("test", None, state_root_rx, None)
+            .with_timeout(Some(Duration::from_secs(30)));
+
+        state_root_tx.send(Ok(test_outcome(B256::repeat_byte(0x42)))).unwrap();
+
+        assert_eq!(
+            handle.state_root().expect("outcome is delivered").state_root,
+            B256::repeat_byte(0x42)
+        );
+    }
+
+    /// A task that is alive but never answers must not park the caller past the bound.
+    #[test]
+    fn payload_state_root_wait_is_bounded_by_timeout() {
+        let (_state_root_tx, state_root_rx) =
+            std::sync::mpsc::channel::<Result<StateRootComputeOutcome, StateRootTaskError>>();
+        let timeout = Duration::from_millis(50);
+        let mut handle = PayloadStateRootHandle::new("test", None, state_root_rx, None)
+            .with_timeout(Some(timeout));
+        assert_eq!(handle.timeout(), Some(timeout));
+
+        let started = std::time::Instant::now();
+        let err = handle.state_root().expect_err("wait elapses");
+
+        assert!(matches!(err, StateRootTaskError::Timeout(elapsed) if elapsed == timeout));
+        assert!(started.elapsed() >= timeout);
+    }
+
+    /// A dropped task disconnects the channel, which is an error rather than a timeout.
+    #[test]
+    fn payload_state_root_with_timeout_reports_dropped_task() {
+        let (state_root_tx, state_root_rx) =
+            std::sync::mpsc::channel::<Result<StateRootComputeOutcome, StateRootTaskError>>();
+        let mut handle = PayloadStateRootHandle::new("test", None, state_root_rx, None)
+            .with_timeout(Some(Duration::from_secs(30)));
+
+        drop(state_root_tx);
+
+        let err = handle.state_root().expect_err("channel is disconnected");
+        assert!(matches!(err, StateRootTaskError::Other(msg) if msg == "state root task dropped"));
     }
 
     #[test]
@@ -775,5 +870,15 @@ mod tests {
             cancel_rx.recv_timeout(Duration::from_secs(1)),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected)
         ));
+    }
+
+    fn test_outcome(state_root: B256) -> StateRootComputeOutcome {
+        StateRootComputeOutcome {
+            state_root,
+            trie_updates: Arc::new(TrieUpdates::default()),
+            hashed_state: Arc::new(HashedPostState::default()),
+            #[cfg(feature = "trie-debug")]
+            debug_recorders: Vec::new(),
+        }
     }
 }

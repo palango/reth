@@ -1,5 +1,6 @@
 use reth_execution_errors::{SparseTrieError, StateProofError};
 use reth_provider::ProviderError;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Error returned by the state-root task and the parallel proof workers.
@@ -20,6 +21,9 @@ pub enum StateRootTaskError {
     /// Sparse trie task stalled.
     #[error("sparse trie task stalled")]
     Stalled,
+    /// The consumer's bounded wait for the result elapsed.
+    #[error("state root task did not answer within {_0:?}")]
+    Timeout(Duration),
     /// The consumer dropped its cancel guard without waiting for the result.
     #[error("state root task canceled: consumer dropped the handle")]
     Canceled,

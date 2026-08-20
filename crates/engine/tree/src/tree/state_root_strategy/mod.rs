@@ -959,7 +959,8 @@ where
                     pending_sparse_trie_prune_blocks,
                 },
             )
-            .into_payload_state_root_handle(),
+            .into_payload_state_root_handle()
+            .with_timeout(ctx.config.state_root_task_timeout()),
         ))
     }
 }

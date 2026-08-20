@@ -465,18 +465,23 @@ where
         builder.evm_mut().db_mut().set_state_hook(None);
 
         // The state-root task has been computing incrementally alongside tx execution.
-        // This recv() waits for the final root hash — most work is already done.
-        // Fall back to sync state root if the trie pipeline fails.
+        // This waits for the final root hash — most work is already done — but only up to the
+        // task's timeout, because a stuck task would otherwise park this build thread for good.
+        // Fall back to sync state root if the trie pipeline fails or does not answer in time.
+        let job = task.name();
         match task.state_root() {
             Ok(outcome) => {
-                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, job = task.name(), "received state root from state-root job");
+                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, job, "received state root from state-root job");
                 builder.finish(
                     state_provider.as_ref(),
                     Some((outcome.state_root, Arc::unwrap_or_clone(outcome.trie_updates))),
                 )?
             }
             Err(err) => {
-                warn!(target: "payload_builder", id=%payload_id, %err, "state-root job failed, falling back to sync state root");
+                warn!(target: "payload_builder", id=%payload_id, %err, job, "state-root job failed, falling back to sync state root");
+                // Cancel the abandoned task so it stops competing for CPU with the walk that
+                // replaces it. The next block pays for a cold sparse trie.
+                drop(task);
                 builder.finish(state_provider.as_ref(), None)?
             }
         }

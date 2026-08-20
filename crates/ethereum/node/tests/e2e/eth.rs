@@ -29,7 +29,7 @@ use reth_rpc_api::TestingBuildBlockRequestV1;
 use reth_rpc_layer::secret_to_bearer_header;
 use reth_tasks::Runtime;
 use ssz::{Decode, Encode};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 const ENGINE_EXECUTION_VERSION_HEADER: &str = "Eth-Execution-Version";
 const ENGINE_PRAGUE_FORK_HEADER: &str = "prague";
@@ -490,6 +490,49 @@ async fn test_share_sparse_trie_with_payload_builder() -> eyre::Result<()> {
     let tree_config = TreeConfig::default()
         .with_share_execution_cache_with_payload_builder(true)
         .with_share_sparse_trie_with_payload_builder(true);
+
+    let (mut nodes, _wallet) = setup_engine::<EthereumNode>(
+        1,
+        Arc::new(
+            ChainSpecBuilder::default()
+                .chain(MAINNET.chain)
+                .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
+                .cancun_activated()
+                .prague_activated()
+                .build(),
+        ),
+        false,
+        tree_config,
+        eth_payload_attributes,
+    )
+    .await?;
+
+    let mut node = nodes.pop().unwrap();
+    let mut rng = rand::rng();
+
+    let num_blocks = 5;
+    advance_with_random_transactions(&mut node, num_blocks, &mut rng, true).await?;
+
+    let best_block = node.inner.provider.best_block_number()?;
+    assert_eq!(best_block, num_blocks as u64, "Expected {} blocks, got {}", num_blocks, best_block);
+
+    Ok(())
+}
+
+/// Tests that block building survives a state-root task that never answers in time.
+///
+/// The timeout is set so low that no task can beat it, which forces both consumers of the
+/// shared sparse trie onto their fallbacks: the payload builder walks the trie synchronously
+/// after dropping the handle, and the engine races its serial fallback. Blocks must still be
+/// built and accepted.
+#[tokio::test]
+async fn test_share_sparse_trie_with_payload_builder_state_root_timeout() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let tree_config = TreeConfig::default()
+        .with_share_execution_cache_with_payload_builder(true)
+        .with_share_sparse_trie_with_payload_builder(true)
+        .with_state_root_task_timeout(Some(Duration::from_nanos(1)));
 
     let (mut nodes, _wallet) = setup_engine::<EthereumNode>(
         1,
