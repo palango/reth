@@ -1102,7 +1102,7 @@ Engine:
           Fully disable sparse trie cache pruning. When set, the cached sparse trie is preserved without any node pruning or storage trie eviction between blocks. Useful for benchmarking the effects of retaining the full trie cache
 
       --engine.state-root-task-timeout <STATE_ROOT_TASK_TIMEOUT>
-          Configure the timeout for the state root task before spawning a sequential fallback. If the state root task takes longer than this, a sequential computation starts in parallel and whichever finishes first is used.
+          Configure the timeout for the state root task before falling back to a sequential computation. If the state root task takes longer than this, block validation starts a sequential computation in parallel and uses whichever finishes first, while a payload build cancels the task and computes the root sequentially.
 
           --engine.state-root-task-timeout 4s --engine.state-root-task-timeout 400ms
 

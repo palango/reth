@@ -185,10 +185,12 @@ pub struct TreeConfig {
     slow_block_threshold: Option<Duration>,
     /// Whether to fully disable sparse trie cache pruning between blocks.
     disable_sparse_trie_cache_pruning: bool,
-    /// Timeout for the state root task before spawning a sequential fallback computation.
-    /// If `Some`, after waiting this duration for the state root task, a sequential state root
-    /// computation is spawned in parallel and whichever finishes first is used.
-    /// If `None`, the timeout fallback is disabled.
+    /// Timeout for the state root task before falling back to a sequential computation.
+    /// If `Some`, after waiting this duration for the state root task, the engine spawns a
+    /// sequential state root computation in parallel and uses whichever finishes first, while
+    /// a payload build cancels the task and computes the root sequentially, because finishing
+    /// the block consumes its block builder and leaves it nothing to race with.
+    /// If `None`, both wait for the task indefinitely.
     state_root_task_timeout: Option<Duration>,
     /// Whether to share execution cache with the payload builder.
     share_execution_cache_with_payload_builder: bool,

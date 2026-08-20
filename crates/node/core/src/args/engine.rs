@@ -496,9 +496,10 @@ pub struct EngineArgs {
     #[arg(long = "engine.disable-sparse-trie-cache-pruning", default_value_t = DefaultEngineValues::get_global().disable_sparse_trie_cache_pruning)]
     pub disable_sparse_trie_cache_pruning: bool,
 
-    /// Configure the timeout for the state root task before spawning a sequential fallback.
-    /// If the state root task takes longer than this, a sequential computation starts in
-    /// parallel and whichever finishes first is used.
+    /// Configure the timeout for the state root task before falling back to a sequential
+    /// computation. If the state root task takes longer than this, block validation starts a
+    /// sequential computation in parallel and uses whichever finishes first, while a payload
+    /// build cancels the task and computes the root sequentially.
     ///
     /// --engine.state-root-task-timeout 4s
     /// --engine.state-root-task-timeout 400ms

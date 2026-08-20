@@ -819,6 +819,34 @@ mod tests {
         assert!(started.elapsed() >= timeout);
     }
 
+    /// A build that gives up on the bound cancels the task it abandoned, which is what lets the
+    /// synchronous walk replacing it have the CPU to itself.
+    #[test]
+    fn payload_state_root_timeout_cancels_the_abandoned_task() {
+        let (updates_tx, _updates_rx) = crossbeam_channel::unbounded();
+        let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
+        let (_state_root_tx, state_root_rx) = std::sync::mpsc::channel();
+        let (_hashed_state_tx, hashed_state_rx) = std::sync::mpsc::channel();
+        let mut handle = StateRootHandle::new(
+            B256::ZERO,
+            updates_tx,
+            cancel_guard,
+            state_root_rx,
+            hashed_state_rx,
+        )
+        .into_payload_state_root_handle()
+        .with_timeout(Some(Duration::from_millis(50)));
+
+        assert!(matches!(handle.state_root(), Err(StateRootTaskError::Timeout(_))));
+        assert!(matches!(cancel_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+
+        drop(handle);
+        assert!(matches!(
+            cancel_rx.recv_timeout(Duration::from_secs(1)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+
     /// A dropped task disconnects the channel, which is an error rather than a timeout.
     #[test]
     fn payload_state_root_with_timeout_reports_dropped_task() {
